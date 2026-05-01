@@ -1,4 +1,5 @@
 import json
+import math
 import urllib
 from datasette import hookimpl
 from datasette.database import QueryInterrupted
@@ -9,6 +10,92 @@ from datasette.utils import (
     detect_json1,
     sqlite3,
 )
+
+
+def freedman_diaconis_bin_width(values):
+    if not values or len(values) < 2:
+        return None
+    sorted_values = sorted(values)
+    n = len(sorted_values)
+    q1_index = int(n * 0.25)
+    q3_index = int(n * 0.75)
+    q1 = sorted_values[q1_index]
+    q3 = sorted_values[q3_index]
+    iqr = q3 - q1
+    if iqr == 0:
+        return None
+    h = 2 * iqr * (n ** (-1 / 3))
+    return h
+
+
+def round_bin_edges(min_val, max_val, bin_width):
+    if bin_width <= 0:
+        return min_val, max_val, 1
+    if bin_width < 1:
+        log10 = math.floor(math.log10(bin_width))
+        multiplier = 10**log10
+        nice_bin_widths = [1, 2, 5]
+        normalized = bin_width / multiplier
+        for nice in nice_bin_widths:
+            if normalized <= nice:
+                bin_width = nice * multiplier
+                break
+        else:
+            bin_width = 10 * multiplier
+    else:
+        bin_width = math.ceil(bin_width)
+    start = math.floor(min_val / bin_width) * bin_width
+    end = math.ceil(max_val / bin_width) * bin_width
+    if end == start:
+        end = start + bin_width
+    num_bins = max(1, int(math.ceil((end - start) / bin_width)))
+    return start, end, num_bins, bin_width
+
+
+def calculate_bins(min_val, max_val, values=None, num_unique=None):
+    if min_val is None or max_val is None:
+        return None
+    if min_val == max_val:
+        return [(min_val, max_val + 1)]
+    if values is not None and len(values) > 0:
+        bin_width = freedman_diaconis_bin_width(values)
+        if bin_width and bin_width > 0:
+            start, end, num_bins, bin_width = round_bin_edges(
+                min_val, max_val, bin_width
+            )
+            bins = []
+            for i in range(num_bins):
+                bin_start = start + i * bin_width
+                bin_end = bin_start + bin_width
+                bins.append((bin_start, bin_end))
+            return bins
+    if num_unique is not None and num_unique <= 10:
+        ranges = []
+        sorted_unique = sorted(set(values) if values else [])
+        for i in range(len(sorted_unique)):
+            if i == 0:
+                start = sorted_unique[i] - 0.5 if sorted_unique[i] == int(sorted_unique[i]) else sorted_unique[i]
+            else:
+                start = (sorted_unique[i] + sorted_unique[i-1]) / 2
+            if i == len(sorted_unique) - 1:
+                end = sorted_unique[i] + 0.5 if sorted_unique[i] == int(sorted_unique[i]) else sorted_unique[i] + 0.1
+            else:
+                end = (sorted_unique[i] + sorted_unique[i+1]) / 2
+            ranges.append((start, end))
+        return ranges
+    data_range = max_val - min_val
+    if data_range <= 0:
+        return [(min_val, max_val + 1)]
+    sqrt_n = math.sqrt(len(values) if values else 100)
+    num_bins = max(5, min(50, int(sqrt_n)))
+    bin_width = data_range / num_bins
+    start, end, num_bins, bin_width = round_bin_edges(min_val, max_val, bin_width)
+    bins = []
+    for i in range(num_bins):
+        bin_start = start + i * bin_width
+        bin_end = bin_start + bin_width
+        bins.append((bin_start, bin_end))
+    return bins
 
 
 def load_facet_configs(request, table_config):
@@ -57,7 +144,7 @@ def load_facet_configs(request, table_config):
 
 @hookimpl
 def register_facet_classes():
-    classes = [ColumnFacet, DateFacet]
+    classes = [ColumnFacet, DateFacet, HistogramFacet]
     if detect_json1():
         classes.append(ArrayFacet)
     return classes
@@ -570,6 +657,261 @@ class DateFacet(Facet):
                             "selected": selected,
                         }
                     )
+            except QueryInterrupted:
+                facets_timed_out.append(column)
+
+        return facet_results, facets_timed_out
+
+
+class HistogramFacet(Facet):
+    type = "histogram"
+
+    async def suggest(self):
+        columns = await self.get_columns(self.sql, self.params)
+        already_enabled = [c["config"]["simple"] for c in self.get_configs()]
+        suggested_facets = []
+        for column in columns:
+            if column in already_enabled:
+                continue
+            try:
+                stats_sql = """
+                    with limited as (select * from ({sql}) limit {suggest_consider})
+                    select
+                        min({column}) as min_val,
+                        max({column}) as max_val,
+                        count(distinct {column}) as distinct_count,
+                        count({column}) as non_null_count
+                    from limited
+                    where {column} is not null
+                """.format(
+                    column=escape_sqlite(column),
+                    sql=self.sql,
+                    suggest_consider=self.suggest_consider,
+                )
+                stats = await self.ds.execute(
+                    self.database,
+                    stats_sql,
+                    self.params,
+                    truncate=False,
+                    custom_time_limit=self.ds.setting("facet_suggest_time_limit_ms"),
+                    log_sql_errors=False,
+                )
+                if not stats.rows:
+                    continue
+                row = stats.rows[0]
+                min_val = row["min_val"]
+                max_val = row["max_val"]
+                distinct_count = row["distinct_count"]
+                non_null_count = row["non_null_count"]
+
+                if non_null_count < 2:
+                    continue
+                if min_val is None or max_val is None:
+                    continue
+
+                if not isinstance(min_val, (int, float)) or not isinstance(max_val, (int, float)):
+                    continue
+
+                value_range = max_val - min_val
+                if value_range <= 0:
+                    continue
+
+                if distinct_count == non_null_count and value_range == distinct_count - 1:
+                    continue
+
+                suggested_facets.append(
+                    {
+                        "name": column,
+                        "type": "histogram",
+                        "toggle_url": self.ds.absolute_url(
+                            self.request,
+                            self.ds.urls.path(
+                                path_with_added_args(
+                                    self.request, {"_facet_histogram": column}
+                                )
+                            ),
+                        ),
+                    }
+                )
+            except (QueryInterrupted, sqlite3.OperationalError):
+                continue
+        return suggested_facets
+
+    async def facet_results(self):
+        facet_results = []
+        facets_timed_out = []
+        args = dict(self.get_querystring_pairs())
+        facet_size = self.get_facet_size()
+
+        for source_and_config in self.get_configs():
+            config = source_and_config["config"]
+            source = source_and_config["source"]
+            column = config.get("column") or config["simple"]
+
+            try:
+                stats_sql = """
+                    select
+                        min({col}) as min_val,
+                        max({col}) as max_val,
+                        count({col}) as non_null_count,
+                        count(*) as total_count
+                    from (
+                        {sql}
+                    )
+                """.format(col=escape_sqlite(column), sql=self.sql)
+                stats_results = await self.ds.execute(
+                    self.database,
+                    stats_sql,
+                    self.params,
+                    truncate=False,
+                    custom_time_limit=self.ds.setting("facet_time_limit_ms"),
+                )
+                stats = stats_results.rows[0]
+                min_val = stats["min_val"]
+                max_val = stats["max_val"]
+                non_null_count = stats["non_null_count"]
+                total_count = stats["total_count"]
+                null_count = total_count - non_null_count
+
+                if min_val is None or max_val is None:
+                    if null_count > 0:
+                        facet_results.append(
+                            {
+                                "name": column,
+                                "type": self.type,
+                                "results": [],
+                                "hideable": source != "metadata",
+                                "toggle_url": path_with_removed_args(
+                                    self.request, {"_facet_histogram": column}
+                                ),
+                                "truncated": False,
+                                "null_count": null_count,
+                            }
+                        )
+                    continue
+
+                sample_sql = """
+                    select {col} as value
+                    from (
+                        {sql}
+                    )
+                    where {col} is not null
+                    order by random()
+                    limit {sample_size}
+                """.format(
+                    col=escape_sqlite(column),
+                    sql=self.sql,
+                    sample_size=min(10000, facet_size * 10),
+                )
+                sample_results = await self.ds.execute(
+                    self.database,
+                    sample_sql,
+                    self.params,
+                    truncate=False,
+                    custom_time_limit=self.ds.setting("facet_time_limit_ms"),
+                )
+                sample_values = [
+                    row["value"] for row in sample_results.rows if row["value"] is not None
+                ]
+
+                bins = calculate_bins(min_val, max_val, sample_values)
+
+                if bins is None:
+                    continue
+
+                facet_results_values = []
+                max_bin_count = 0
+
+                for bin_start, bin_end in bins:
+                    if bin_start == bin_end:
+                        bin_end = bin_start + 1
+
+                    bin_sql = """
+                        select count(*) as count
+                        from (
+                            {sql}
+                        )
+                        where {col} >= ? and {col} < ?
+                    """.format(col=escape_sqlite(column), sql=self.sql)
+
+                    bin_params = list(self.params) if self.params else []
+                    bin_params.extend([bin_start, bin_end])
+
+                    bin_results = await self.ds.execute(
+                        self.database,
+                        bin_sql,
+                        bin_params,
+                        truncate=False,
+                        custom_time_limit=self.ds.setting("facet_time_limit_ms"),
+                    )
+                    bin_count = bin_results.rows[0]["count"] if bin_results.rows else 0
+                    max_bin_count = max(max_bin_count, bin_count)
+
+                    gte_key = f"{column}__gte"
+                    lt_key = f"{column}__lt"
+
+                    param_gte = args.get(gte_key)
+                    param_lt = args.get(lt_key)
+
+                    is_selected = False
+                    if param_gte is not None or param_lt is not None:
+                        try:
+                            param_gte_val = float(param_gte) if param_gte is not None else None
+                            param_lt_val = float(param_lt) if param_lt is not None else None
+                            gte_overlaps = (param_gte_val is None) or (param_gte_val < bin_end)
+                            lt_overlaps = (param_lt_val is None) or (bin_start < param_lt_val)
+                            is_selected = gte_overlaps and lt_overlaps
+                        except (ValueError, TypeError):
+                            is_selected = False
+
+                    if is_selected:
+                        toggle_path = path_with_removed_args(
+                            self.request, {gte_key, lt_key}
+                        )
+                    else:
+                        path_without_old = path_with_removed_args(
+                            self.request, {gte_key, lt_key}
+                        )
+                        toggle_path = path_with_added_args(
+                            self.request,
+                            {gte_key: bin_start, lt_key: bin_end},
+                            path=path_without_old,
+                        )
+
+                    if bin_start == int(bin_start) and bin_end == int(bin_end):
+                        label = f"{int(bin_start)} - {int(bin_end)}"
+                    else:
+                        label = f"{bin_start} - {bin_end}"
+
+                    facet_results_values.append(
+                        {
+                            "value": {"start": bin_start, "end": bin_end},
+                            "label": label,
+                            "count": bin_count,
+                            "toggle_url": self.ds.absolute_url(self.request, toggle_path),
+                            "selected": is_selected,
+                            "bin_start": bin_start,
+                            "bin_end": bin_end,
+                        }
+                    )
+
+                facet_results.append(
+                    {
+                        "name": column,
+                        "type": self.type,
+                        "results": facet_results_values,
+                        "hideable": source != "metadata",
+                        "toggle_url": path_with_removed_args(
+                            self.request, {"_facet_histogram": column}
+                        ),
+                        "truncated": False,
+                        "null_count": null_count,
+                        "min_val": min_val,
+                        "max_val": max_val,
+                        "max_bin_count": max_bin_count,
+                    }
+                )
+
             except QueryInterrupted:
                 facets_timed_out.append(column)
 

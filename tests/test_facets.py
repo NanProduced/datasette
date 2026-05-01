@@ -734,3 +734,257 @@ async def test_facet_only_considers_first_x_rows():
         assert data2["suggested_facets"] == []
     finally:
         Facet.suggest_consider = original_suggest_consider
+
+
+from datasette.facets import (
+    freedman_diaconis_bin_width,
+    round_bin_edges,
+    calculate_bins,
+    HistogramFacet,
+)
+
+
+def test_freedman_diaconis_bin_width():
+    values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    h = freedman_diaconis_bin_width(values)
+    assert h is not None
+    assert h > 0
+
+
+def test_freedman_diaconis_bin_width_insufficient_data():
+    assert freedman_diaconis_bin_width([]) is None
+    assert freedman_diaconis_bin_width([1]) is None
+
+
+def test_freedman_diaconis_bin_width_same_values():
+    assert freedman_diaconis_bin_width([5, 5, 5, 5]) is None
+
+
+def test_round_bin_edges():
+    start, end, num_bins, width = round_bin_edges(1, 10, 2)
+    assert start == 0
+    assert end == 10
+    assert width == 2
+    assert num_bins == 5
+
+
+def test_round_bin_edges_small_values():
+    start, end, num_bins, width = round_bin_edges(0.1, 0.9, 0.15)
+    assert start <= 0.1
+    assert end >= 0.9
+    assert width in (0.1, 0.2)
+    assert num_bins >= 4
+
+
+def test_calculate_bins_freedman_diaconis():
+    values = list(range(1, 101))
+    bins = calculate_bins(1, 100, values)
+    assert bins is not None
+    assert len(bins) > 0
+    for start, end in bins:
+        assert start < end
+
+
+def test_calculate_bins_single_value():
+    bins = calculate_bins(5, 5, [5])
+    assert bins == [(5, 6)]
+
+
+def test_calculate_bins_none():
+    assert calculate_bins(None, 10) is None
+    assert calculate_bins(10, None) is None
+
+
+@pytest.mark.asyncio
+async def test_histogram_facet_suggest():
+    ds = Datasette()
+    db = ds.add_memory_database("test_histogram_suggest")
+    await db.execute_write(
+        "create table products (id integer primary key, price integer, name text)"
+    )
+    for i in range(20):
+        await db.execute_write(
+            "insert into products (price, name) values (?, ?)",
+            [i * 10, f"Product {i}"],
+        )
+    response = await ds.client.get(
+        "/test_histogram_suggest/products.json?_extra=suggested_facets"
+    )
+    data = response.json()
+    histogram_facets = [
+        f for f in data["suggested_facets"] if f.get("type") == "histogram"
+    ]
+    assert len(histogram_facets) == 1
+    assert histogram_facets[0]["name"] == "price"
+    assert "_facet_histogram=price" in histogram_facets[0]["toggle_url"]
+
+
+@pytest.mark.asyncio
+async def test_histogram_facet_results():
+    ds = Datasette()
+    db = ds.add_memory_database("test_histogram_results")
+    await db.execute_write(
+        "create table ages (id integer primary key, age integer)"
+    )
+    ages = [18, 22, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 25, 30, 35, 40, 45, 50]
+    for age in ages:
+        await db.execute_write("insert into ages (age) values (?)", [age])
+    response = await ds.client.get(
+        "/test_histogram_results/ages.json?_facet_histogram=age"
+    )
+    data = response.json()
+    assert "age" in data["facet_results"]["results"]
+    age_facet = data["facet_results"]["results"]["age"]
+    assert age_facet["type"] == "histogram"
+    assert "results" in age_facet
+    assert len(age_facet["results"]) > 0
+    total_count = sum(r["count"] for r in age_facet["results"])
+    assert total_count == len(ages)
+    for bin_result in age_facet["results"]:
+        assert "bin_start" in bin_result
+        assert "bin_end" in bin_result
+        assert "label" in bin_result
+        assert "toggle_url" in bin_result
+        assert bin_result["bin_start"] < bin_result["bin_end"]
+
+
+@pytest.mark.asyncio
+async def test_histogram_facet_null_values():
+    ds = Datasette()
+    db = ds.add_memory_database("test_histogram_nulls")
+    await db.execute_write(
+        "create table temps (id integer primary key, temperature real)"
+    )
+    temps = [20.5, 22.3, None, 25.1, None, 18.9, None, 30.2]
+    for temp in temps:
+        await db.execute_write("insert into temps (temperature) values (?)", [temp])
+    response = await ds.client.get(
+        "/test_histogram_nulls/temps.json?_facet_histogram=temperature"
+    )
+    data = response.json()
+    temp_facet = data["facet_results"]["results"]["temperature"]
+    assert temp_facet["null_count"] == 3
+    non_null_count = sum(r["count"] for r in temp_facet["results"])
+    assert non_null_count == 5
+
+
+@pytest.mark.asyncio
+async def test_histogram_facet_filter_by_bin():
+    ds = Datasette()
+    db = ds.add_memory_database("test_histogram_filter")
+    await db.execute_write(
+        "create table salaries (id integer primary key, salary integer)"
+    )
+    salaries = [30000, 35000, 40000, 45000, 50000, 55000, 60000, 65000, 70000, 75000]
+    for sal in salaries:
+        await db.execute_write("insert into salaries (salary) values (?)", [sal])
+    facet_response = await ds.client.get(
+        "/test_histogram_filter/salaries.json?_facet_histogram=salary"
+    )
+    facet_data = facet_response.json()
+    salary_facet = facet_data["facet_results"]["results"]["salary"]
+    assert len(salary_facet["results"]) > 0
+    first_bin = salary_facet["results"][0]
+    assert "toggle_url" in first_bin
+    assert not first_bin["selected"]
+    filter_response = await ds.client.get(
+        f"/test_histogram_filter/salaries.json?_facet_histogram=salary&salary__gte={first_bin['bin_start']}&salary__lt={first_bin['bin_end']}"
+    )
+    filter_data = filter_response.json()
+    filtered_facet = filter_data["facet_results"]["results"]["salary"]
+    selected_bins = [r for r in filtered_facet["results"] if r["selected"]]
+    assert len(selected_bins) >= 1
+
+
+@pytest.mark.asyncio
+async def test_histogram_facet_all_nulls():
+    ds = Datasette()
+    db = ds.add_memory_database("test_histogram_all_nulls")
+    await db.execute_write(
+        "create table all_nulls (id integer primary key, value integer)"
+    )
+    for _ in range(5):
+        await db.execute_write("insert into all_nulls (value) values (null)")
+    response = await ds.client.get(
+        "/test_histogram_all_nulls/all_nulls.json?_facet_histogram=value"
+    )
+    data = response.json()
+    value_facet = data["facet_results"]["results"]["value"]
+    assert value_facet["null_count"] == 5
+    assert len(value_facet["results"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_histogram_facet_real_numbers():
+    ds = Datasette()
+    db = ds.add_memory_database("test_histogram_reals")
+    await db.execute_write(
+        "create table measurements (id integer primary key, value real)"
+    )
+    import random
+    random.seed(42)
+    for _ in range(100):
+        value = random.gauss(50, 10)
+        await db.execute_write("insert into measurements (value) values (?)", [value])
+    response = await ds.client.get(
+        "/test_histogram_reals/measurements.json?_facet_histogram=value"
+    )
+    data = response.json()
+    value_facet = data["facet_results"]["results"]["value"]
+    assert len(value_facet["results"]) > 0
+    assert value_facet["min_val"] is not None
+    assert value_facet["max_val"] is not None
+    assert value_facet["max_bin_count"] > 0
+    total_count = sum(r["count"] for r in value_facet["results"])
+    assert total_count == 100
+
+
+@pytest.mark.asyncio
+async def test_histogram_facet_from_metadata():
+    ds = Datasette(
+        [],
+        memory=True,
+        config={
+            "databases": {
+                "test_histogram_metadata": {
+                    "tables": {
+                        "items": {
+                            "facets": [{"histogram": "quantity"}]
+                        }
+                    }
+                }
+            }
+        }
+    )
+    db = ds.add_memory_database("test_histogram_metadata")
+    await db.execute_write(
+        "create table items (id integer primary key, quantity integer, name text)"
+    )
+    for i in range(10):
+        await db.execute_write(
+            "insert into items (quantity, name) values (?, ?)",
+            [i * 5, f"Item {i}"],
+        )
+    response = await ds.client.get("/test_histogram_metadata/items.json")
+    data = response.json()
+    assert "quantity" in data["facet_results"]["results"]
+    quantity_facet = data["facet_results"]["results"]["quantity"]
+    assert quantity_facet["type"] == "histogram"
+    assert quantity_facet["hideable"] == False
+
+
+@pytest.mark.asyncio
+async def test_histogram_facet_with_existing_column_facet():
+    ds = Datasette()
+    db = ds.add_memory_database("test_histogram_conflict")
+    await db.execute_write(
+        "create table data (id integer primary key, value integer)"
+    )
+    for i in range(20):
+        await db.execute_write("insert into data (value) values (?)", [i % 5])
+    response = await ds.client.get(
+        "/test_histogram_conflict/data.json?_facet=value&_facet_histogram=value"
+    )
+    data = response.json()
+    assert "value" in data["facet_results"]["results"]
+    assert "value_2" in data["facet_results"]["results"]
