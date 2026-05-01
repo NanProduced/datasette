@@ -47,6 +47,13 @@ async def geojson_ds_client():
         37.0414, -122.0725
     );
     
+    CREATE TABLE large_spatial_table (
+        pk integer primary key,
+        name text,
+        latitude real,
+        longitude real
+    );
+    
     CREATE TABLE alt_columns (
         pk integer primary key,
         name text,
@@ -97,6 +104,22 @@ async def geojson_ds_client():
     def prepare(conn):
         if not conn.execute("select count(*) from sqlite_master").fetchone()[0]:
             conn.executescript(TABLES)
+            cursor = conn.cursor()
+            for i in range(200):
+                if i < 50:
+                    lat = 37.0 + (i * 0.001)
+                    lon = -122.0 + (i * 0.001)
+                elif i < 150:
+                    lat = 40.0 + (i * 0.001)
+                    lon = -120.0 + (i * 0.001)
+                else:
+                    lat = 37.1 + ((i - 150) * 0.001)
+                    lon = -121.9 + ((i - 150) * 0.001)
+                cursor.execute(
+                    "INSERT INTO large_spatial_table (pk, name, latitude, longitude) VALUES (?, ?, ?, ?)",
+                    (i + 1, f"Point {i + 1}", lat, lon)
+                )
+            conn.commit()
     
     await db.execute_write_fn(prepare)
     await ds.invoke_startup()
@@ -189,3 +212,30 @@ async def test_geojson_crs_header(geojson_ds_client):
     response3 = await geojson_ds_client.get("/geojson/roadside_attractions.geojson?_crs=urn:ogc:def:crs:EPSG::4326")
     assert response3.status_code == 200
     assert response3.headers.get("content-crs") == "urn:ogc:def:crs:EPSG::4326"
+
+
+@pytest.mark.asyncio
+async def test_geojson_bbox_filter_sql_level(geojson_ds_client):
+    response_no_bbox = await geojson_ds_client.get("/geojson/large_spatial_table.geojson?_size=100")
+    assert response_no_bbox.status_code == 200
+    data_no_bbox = response_no_bbox.json()
+    assert len(data_no_bbox["features"]) == 100
+    
+    response_bbox = await geojson_ds_client.get(
+        "/geojson/large_spatial_table.geojson?_bbox=-122.1,36.9,-121.8,37.2&_size=100"
+    )
+    assert response_bbox.status_code == 200
+    data_bbox = response_bbox.json()
+    
+    assert len(data_bbox["features"]) == 100
+    
+    pks_in_bbox = [feature["properties"]["pk"] for feature in data_bbox["features"]]
+    pks_in_bbox.sort()
+    
+    expected_pks = list(range(1, 51)) + list(range(151, 201))
+    assert pks_in_bbox == expected_pks
+    
+    for feature in data_bbox["features"]:
+        lon, lat = feature["geometry"]["coordinates"]
+        assert -122.1 <= lon <= -121.8
+        assert 36.9 <= lat <= 37.2
