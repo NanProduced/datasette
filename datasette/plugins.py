@@ -28,6 +28,7 @@ DEFAULT_PLUGINS = (
     "datasette.default_column_types",
     "datasette.default_magic_parameters",
     "datasette.blob_renderer",
+    "datasette.geojson_renderer",
     "datasette.default_menu_links",
     "datasette.handle_exception",
     "datasette.forbidden",
