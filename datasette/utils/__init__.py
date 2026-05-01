@@ -330,12 +330,18 @@ def append_querystring(url, querystring):
 
 
 def path_with_added_args(request, args, path=None):
-    path = path or request.path
+    query_string = request.query_string
+    if path is None:
+        path = request.path
+    else:
+        if "?" in path:
+            bits = path.split("?", 1)
+            path, query_string = bits
     if isinstance(args, dict):
         args = args.items()
     args_to_remove = {k for k, v in args if v is None}
     current = []
-    for key, value in urllib.parse.parse_qsl(request.query_string):
+    for key, value in urllib.parse.parse_qsl(query_string):
         if key not in args_to_remove:
             current.append((key, value))
     current.extend([(key, value) for key, value in args if value is not None])
@@ -375,12 +381,18 @@ def path_with_removed_args(request, args, path=None):
 
 
 def path_with_replaced_args(request, args, path=None):
-    path = path or request.path
+    query_string = request.query_string
+    if path is None:
+        path = request.path
+    else:
+        if "?" in path:
+            bits = path.split("?", 1)
+            path, query_string = bits
     if isinstance(args, dict):
         args = args.items()
     keys_to_replace = {p[0] for p in args}
     current = []
-    for key, value in urllib.parse.parse_qsl(request.query_string):
+    for key, value in urllib.parse.parse_qsl(query_string):
         if key not in keys_to_replace:
             current.append((key, value))
     current.extend([p for p in args if p[1] is not None])
