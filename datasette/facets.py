@@ -902,7 +902,7 @@ class HistogramFacet(Facet):
                         "results": facet_results_values,
                         "hideable": source != "metadata",
                         "toggle_url": path_with_removed_args(
-                            self.request, {"_facet_histogram": column}
+                            self.request, {f"{column}__gte", f"{column}__lt"}
                         ),
                         "truncated": False,
                         "null_count": null_count,
