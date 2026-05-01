@@ -1,5 +1,7 @@
 from datasette import hookimpl
 from datasette.utils.asgi import Response, BadRequest
+from datasette.utils import escape_sqlite
+from datasette.filters import FilterArguments
 import json
 
 
@@ -44,6 +46,56 @@ def point_in_bbox(lon, lat, bbox):
         return False
 
 
+@hookimpl(specname="filters_from_request")
+def bbox_filter(request, database, table, datasette):
+    async def inner():
+        if request.url_vars.get("format") != "geojson":
+            return None
+        
+        if "_bbox" not in request.args:
+            return None
+        
+        try:
+            bbox = parse_bbox(request.args["_bbox"])
+        except BadRequest:
+            return None
+        
+        db = datasette.get_database(database)
+        table_columns = await db.table_columns(table)
+        
+        lat_col, lon_col = find_spatial_columns(table_columns)
+        if lat_col is None or lon_col is None:
+            return None
+        
+        min_lon, min_lat, max_lon, max_lat = bbox
+        
+        where_clauses = [
+            f"{escape_sqlite(lon_col)} >= :bbox_min_lon",
+            f"{escape_sqlite(lon_col)} <= :bbox_max_lon",
+            f"{escape_sqlite(lat_col)} >= :bbox_min_lat",
+            f"{escape_sqlite(lat_col)} <= :bbox_max_lat",
+        ]
+        
+        params = {
+            "bbox_min_lon": min_lon,
+            "bbox_max_lon": max_lon,
+            "bbox_min_lat": min_lat,
+            "bbox_max_lat": max_lat,
+        }
+        
+        human_descriptions = [
+            f"bounding box: {min_lon},{min_lat},{max_lon},{max_lat}"
+        ]
+        
+        return FilterArguments(
+            where_clauses=where_clauses,
+            params=params,
+            human_descriptions=human_descriptions,
+        )
+    
+    return inner
+
+
 async def render_geojson(
     datasette, columns, rows, sql, query_name, database, table, request, view_name, data
 ):
@@ -56,10 +108,6 @@ async def render_geojson(
         if lon_col is None:
             missing.append("longitude column (longitude, lon, lng, x)")
         raise BadRequest(f"Table is not spatial. Missing: {', '.join(missing)}")
-    
-    bbox = None
-    if "_bbox" in request.args:
-        bbox = parse_bbox(request.args["_bbox"])
     
     crs = request.args.get("_crs", "EPSG:4326")
     
@@ -75,9 +123,6 @@ async def render_geojson(
             lat_val = row[lat_idx]
             lon_val = row[lon_idx]
             properties = {columns[i]: row[i] for i in range(len(columns)) if columns[i] not in (lat_col, lon_col)}
-        
-        if not point_in_bbox(lon_val, lat_val, bbox):
-            continue
         
         try:
             lat = float(lat_val)
@@ -95,10 +140,18 @@ async def render_geojson(
         }
         features.append(feature)
     
+    truncated = data.get("truncated") if data else None
+    next_url = data.get("next_url") if data else None
+    
     feature_collection = {
         "type": "FeatureCollection",
         "features": features
     }
+    
+    if truncated:
+        feature_collection["truncated"] = True
+    if next_url:
+        feature_collection["next_url"] = next_url
     
     headers = {}
     if crs:
